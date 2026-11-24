@@ -166,13 +166,13 @@ fn test_spv_client(
         log::trace!("process {} headers at one time", headers.len());
         let update = if headers_group_size % 5 == 0 {
             let tmp_headers = mem::take(&mut headers);
-            let _update = service.update(tmp_headers.clone(), 0).unwrap();
+            let _update = service.update(tmp_headers.clone()).unwrap();
             log::trace!("rollback to previous client (for test): {old_client}");
             service.rollback_to(old_client.unpack()).unwrap();
             log::trace!("process {} headers again", headers.len());
-            service.update(tmp_headers, 0)
+            service.update(tmp_headers)
         } else {
-            service.update(mem::take(&mut headers), 0)
+            service.update(mem::take(&mut headers))
         }
         .unwrap();
         if verify_tx_range.0 <= height + 1 && height <= verify_tx_range.1 {
@@ -298,4 +298,63 @@ fn spv_client_case_1() {
         "case-0830000_0830000",
         (829995, 830005),
     );
+}
+
+/// Feeds a Testnet4-shaped period into `DummyService` and checks the stored target adjust info.
+///
+/// Times and bits come from real Testnet4 headers: 78624 (period start), 80639 (period end,
+/// minimum difficulty) and 80640 (next period start). Other header fields are not checked
+/// by `DummyService`.
+fn dummy_service_after_testnet4_period(flags: u8) -> DummyService {
+    use bitcoin::blockdata::constants::DIFFCHANGE_INTERVAL;
+
+    let mut header = genesis_block_header();
+    header.time = 1745204073;
+    header.bits = core::CompactTarget::from_consensus(0x1905f649);
+    let start_height = 78624;
+    let mut service = DummyService::bootstrap_with_flags(start_height, header, flags).unwrap();
+    let headers = (1..DIFFCHANGE_INTERVAL)
+        .map(|i| {
+            let mut h = header;
+            h.time = header.time + i * 500;
+            if i == DIFFCHANGE_INTERVAL - 1 {
+                h.time = 1746245684;
+                h.bits = core::CompactTarget::from_consensus(0x1d00ffff);
+            }
+            h
+        })
+        .collect::<Vec<_>>();
+    service.update(headers).unwrap();
+    assert_eq!(service.max_height(), 80639);
+    service
+}
+
+fn target_adjust_info(service: &DummyService) -> (u32, u32) {
+    let (time, bits) = service.tip_client().target_adjust_info.decode().unwrap();
+    (time, bits.to_consensus())
+}
+
+#[test]
+fn dummy_service_testnet4_retarget_uses_period_start_target() {
+    use ckb_bitcoin_spv_verifier::constants::{FLAG_CHAIN_TYPE_TESTNET, FLAG_CHAIN_TYPE_TESTNET4};
+
+    let mut service = dummy_service_after_testnet4_period(FLAG_CHAIN_TYPE_TESTNET4);
+    // The actual bits of Testnet4 header 80640.
+    assert_eq!(target_adjust_info(&service), (1745204073, 0x19052250));
+
+    // Same as the verifier: the first block of a period only restarts the period time.
+    // Even a header with an unexpected target doesn't change the stored next target.
+    let mut first = genesis_block_header();
+    first.time = 1746247885;
+    first.bits = core::CompactTarget::from_consensus(0x1d00ffff);
+    service.update(vec![first]).unwrap();
+    assert_eq!(target_adjust_info(&service), (1746247885, 0x19052250));
+
+    // Testnet3 bases the retarget on the last block, which is at min difficulty.
+    let service = dummy_service_after_testnet4_period(FLAG_CHAIN_TYPE_TESTNET);
+    assert_eq!(target_adjust_info(&service), (1745204073, 0x1d00dc71));
+}
+
+fn genesis_block_header() -> core::Header {
+    bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header
 }

@@ -9,6 +9,7 @@ use bitcoin::{
 use molecule::bytes::Bytes;
 
 use crate::{
+    constants::{BIP94_MAX_TIMEWARP, TESTNET_MIN_DIFFICULTY_BITS, TESTNET_MIN_DIFFICULTY_TIME_GAP},
     core::result::Result,
     error::{BootstrapError, UpdateError, VerifyTxError},
     types::{core, packed, prelude::*},
@@ -129,6 +130,14 @@ impl packed::SpvClient {
             .decode()
             .map_err(|_| UpdateError::DecodeTargetAdjustInfo)?;
         trace!("tip block hash: {new_tip_block_hash:#x}, max height: {new_max_height}");
+        let chain_type: core::BitcoinChainType = flags.into();
+        let min_bits = core::CompactTarget::from_consensus(TESTNET_MIN_DIFFICULTY_BITS);
+        // The time of the previous header.
+        //
+        // The SPV client doesn't store the time of its tip header, so it's unknown for the
+        // first header of an update; the time-related rules below are only applied to the
+        // other headers.
+        let mut prev_time: Option<u32> = None;
         for header in update.headers().as_reader().iter() {
             new_max_height += 1;
             let header: core::Header =
@@ -138,36 +147,64 @@ impl packed::SpvClient {
                 error!("failed: headers are uncontinuous");
                 return Err(UpdateError::UncontinuousHeaders);
             }
+            let is_first_of_period = new_max_height % DIFFCHANGE_INTERVAL == 0;
             // Check the target adjust info.
-            if new_info.1 != header.bits {
+            //
+            // Testnet3 and Testnet4 allow minimum-difficulty blocks (BIP-94 rule 1):
+            // - For a block that isn't the first one of a difficulty period, if its time is
+            //   more than 20 minutes after the previous block, it must use the minimum
+            //   difficulty; otherwise, it must use the actual difficulty of the period.
+            // - The first block of a difficulty period always uses the actual difficulty.
+            //
+            // Ref: `GetNextWorkRequired(..)` in Bitcoin Core `src/pow.cpp`.
+            let allow_min_difficulty = matches!(
+                chain_type,
+                core::BitcoinChainType::Testnet | core::BitcoinChainType::Testnet4
+            ) && !is_first_of_period;
+            let is_valid_bits = if allow_min_difficulty {
+                match prev_time {
+                    Some(prev_time) => {
+                        let expected = if u64::from(header.time)
+                            > u64::from(prev_time) + u64::from(TESTNET_MIN_DIFFICULTY_TIME_GAP)
+                        {
+                            min_bits
+                        } else {
+                            new_info.1
+                        };
+                        header.bits == expected
+                    }
+                    // Without the previous time, either target could be valid.
+                    None => header.bits == new_info.1 || header.bits == min_bits,
+                }
+            } else {
+                header.bits == new_info.1
+            };
+            if !is_valid_bits {
                 log_if_enabled!(|Error| {
                     let expected = new_info.1.to_consensus();
                     let actual = header.bits.to_consensus();
                     error!(
                         "failed: invalid difficulty for header-{new_max_height}, \
-                        expect {expected} but got {actual}"
+                        expect {expected} (or the minimum difficulty if allowed) \
+                        but got {actual}"
                     );
                 });
-
-                match flags.into() {
-                    // https://github.com/bitcoin/bips/blob/master/bip-0094.mediawiki#1-20-minute-exception-rule
-                    // Testnet3 & Testnet4
-                    // 1. For any block except the first block in a difficulty period:
-                    //    a. If the block's timestamp is >20 minutes past the timestamp of the previous block
-                    //    b. Then the block MUST use the minimum difficulty value 0x1d00ffff, regardless of the network's actual difficulty
-                    // 2. The first block of each difficulty period MUST use the actual network difficulty.
-                    core::BitcoinChainType::Testnet | core::BitcoinChainType::Testnet4 => {
-                        let is_first_of_period = new_max_height % DIFFCHANGE_INTERVAL == 0;
-                        let min_bits = core::CompactTarget::from_consensus(
-                            crate::constants::TESTNET_MIN_DIFFICULTY_BITS,
+                return Err(UpdateError::Difficulty);
+            }
+            // Check the time-warp rule for Testnet4 (BIP-94 rule 3):
+            // the first block of a difficulty period can't be earlier than its previous block
+            // by more than 600 seconds.
+            if core::BitcoinChainType::Testnet4 == chain_type && is_first_of_period {
+                if let Some(prev_time) = prev_time {
+                    if u64::from(header.time) + u64::from(BIP94_MAX_TIMEWARP) < u64::from(prev_time)
+                    {
+                        error!(
+                            "failed: time-warp for header-{new_max_height}, \
+                            time {} is earlier than the previous time {prev_time} \
+                            by more than {BIP94_MAX_TIMEWARP} seconds",
+                            header.time
                         );
-                        if is_first_of_period || header.bits != min_bits {
-                            return Err(UpdateError::Difficulty);
-                        }
-                    }
-                    // For mainnet and signet, `header.bits` should be as the same as `new_info.1`.
-                    _ => {
-                        return Err(UpdateError::Difficulty);
+                        return Err(UpdateError::Timewarp);
                     }
                 }
             }
@@ -188,7 +225,7 @@ impl packed::SpvClient {
                         //    a. The base difficulty value MUST be taken from the first block of the previous difficulty period (new_info.1)
                         //    b. NOT from the last block as in previous implementations to prevent block storms from 20-minute exception.
                         // 2. The adjustment factor calculation remains unchanged.
-                        let prev_target = if core::BitcoinChainType::Testnet4 == flags.into() {
+                        let prev_target = if core::BitcoinChainType::Testnet4 == chain_type {
                             new_info.1.into()
                         } else {
                             header.bits.into()
@@ -204,6 +241,7 @@ impl packed::SpvClient {
                     _ => {}
                 }
             }
+            prev_time = Some(header.time);
             let digest = core::HeaderDigest::new_leaf(new_max_height, &header);
             trace!(
                 "tip block hash: {new_tip_block_hash:#x}, max height: {new_max_height}, \

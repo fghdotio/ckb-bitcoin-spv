@@ -19,10 +19,19 @@ pub struct DummyService {
     client: core::SpvClient,
     store: mmr::lib::util::MemStore<packed::HeaderDigest>,
     headers: HashMap<u32, core::Header>,
+    flags: u8,
 }
 
 impl DummyService {
+    /// Bootstraps a service for Bitcoin mainnet.
     pub fn bootstrap(height: u32, header: core::Header) -> Result<Self> {
+        Self::bootstrap_with_flags(height, header, 0)
+    }
+
+    /// Bootstraps a service for the chain selected by `flags`.
+    ///
+    /// The `flags` are the same as `SpvTypeArgs::flags`, and they are used for all updates.
+    pub fn bootstrap_with_flags(height: u32, header: core::Header, flags: u8) -> Result<Self> {
         if height % DIFFCHANGE_INTERVAL != 0 {
             let msg = format!(
                 "bad bootstrap height, expected multiples of \
@@ -52,10 +61,11 @@ impl DummyService {
             client,
             store,
             headers,
+            flags,
         })
     }
 
-    pub fn update(&mut self, headers: Vec<core::Header>, flags: u8) -> Result<packed::SpvUpdate> {
+    pub fn update(&mut self, headers: Vec<core::Header>) -> Result<packed::SpvUpdate> {
         let mut mmr = {
             let last_index =
                 self.client.headers_mmr_root.max_height - self.client.headers_mmr_root.min_height;
@@ -80,19 +90,20 @@ impl DummyService {
             mmr.push(digest)?;
             self.headers.insert(height, header.to_owned());
 
+            let (start_time, next_bits) =
+                self.client.target_adjust_info.decode().map_err(|err| {
+                    Error::other(format!("failed to decode target adjust info since {err}"))
+                })?;
+            // Keep the same state transition as `SpvClient::verify_new_client(..)`.
             match (height + 1) % DIFFCHANGE_INTERVAL {
+                // Next block is the first block for a new difficulty.
                 0 => {
-                    // For Testnet4 (BIP 94 block storm fix):
-                    // Use the first block's difficulty as the baseline,
-                    // NOT the last block's difficulty.
+                    // BIP-94 (Testnet4) takes the base target from the first block of the
+                    // period, which is the stored `next_bits`, rather than the last block,
+                    // which could be a minimum-difficulty block.
                     let prev_target: core::Target =
-                        if BitcoinChainType::Testnet4 == flags.into() {
-                            self.client
-                                .target_adjust_info
-                                .decode()
-                                .expect("decode target adjust info")
-                                .1
-                                .into()
+                        if BitcoinChainType::Testnet4 == self.flags.into() {
+                            next_bits.into()
                         } else {
                             header.bits.into()
                         };
@@ -100,9 +111,8 @@ impl DummyService {
                         ">>> height {height:07}, time: {}, target {prev_target:#x}",
                         header.time
                     );
-                    let start_time: u32 = self.client.target_adjust_info.start_time().unpack();
                     let next_target =
-                        calculate_next_target(prev_target, start_time, header.time, flags);
+                        calculate_next_target(prev_target, start_time, header.time, self.flags);
                     log::info!(">>> calculated new target  {next_target:#x}");
                     let next_bits = next_target.to_compact_lossy();
                     let next_target: core::Target = next_bits.into();
@@ -111,9 +121,10 @@ impl DummyService {
                     self.client.target_adjust_info =
                         packed::TargetAdjustInfo::encode(start_time, next_bits);
                 }
+                // Current block is the first block for a new difficulty.
                 1 => {
                     self.client.target_adjust_info =
-                        packed::TargetAdjustInfo::encode(header.time, header.bits);
+                        packed::TargetAdjustInfo::encode(header.time, next_bits);
                 }
                 _ => {}
             };

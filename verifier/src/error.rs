@@ -19,6 +19,7 @@ pub enum UpdateError {
     UncontinuousHeaders,
     Difficulty,
     Pow,
+    Timewarp,
     // Check MMR proof.
     Mmr = 0x11,
     HeadersMmrProof,
